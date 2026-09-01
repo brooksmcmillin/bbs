@@ -1,6 +1,6 @@
 # bbs (Better Bitwarden Secrets)
 
-Create a Bitwarden Secrets Manager secret without passing the **secret value** as a command-line argument. It uses Bitwarden's official Rust Secrets Manager SDK, so encryption and the Secrets Manager API protocol remain Bitwarden-managed.
+A Bitwarden Secrets Manager command-line tool. It uses Bitwarden's official Rust Secrets Manager SDK, so encryption and the Secrets Manager API protocol remain Bitwarden-managed.
 
 ## Install
 
@@ -14,7 +14,7 @@ Set the service-account token outside the command line:
 
 ```bash
 export BWS_ACCESS_TOKEN='0...'
-bbs DATABASE_PASSWORD 00000000-0000-0000-0000-000000000000
+bbs create DATABASE_PASSWORD 00000000-0000-0000-0000-000000000000
 ```
 
 The default mode reads a hidden value from the controlling terminal.
@@ -23,17 +23,27 @@ To receive the value from standard input instead, use `--stdin`:
 
 ```bash
 printf %s "$DATABASE_PASSWORD" |
-  bbs --stdin DATABASE_PASSWORD 00000000-0000-0000-0000-000000000000
+  bbs create --stdin DATABASE_PASSWORD 00000000-0000-0000-0000-000000000000
 ```
 
 `--stdin` preserves input exactly, including a trailing newline. Use `printf`, rather than `echo`, when a trailing newline is unintended.
+
+### List secret names
+
+List every secret key in a project without retrieving or printing any secret values:
+
+```bash
+bbs list 00000000-0000-0000-0000-000000000000
+```
+
+The names are printed one per line, sorted alphabetically. This is useful for checking whether a secret exists without leaking its value.
 
 ### Upsert
 
 By default, the tool always creates a secret. Pass `--upsert` to find a secret with the requested key **in the specified project** and update its value instead:
 
 ```bash
-bbs --upsert DATABASE_PASSWORD 00000000-0000-0000-0000-000000000000
+bbs create --upsert DATABASE_PASSWORD 00000000-0000-0000-0000-000000000000
 ```
 
 If no match exists, it creates one. If duplicate matching keys already exist in the project, it stops without changing any secret rather than choosing arbitrarily. When updating, an omitted `--note` preserves the existing note.

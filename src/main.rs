@@ -12,40 +12,52 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 #[derive(Debug, Parser)]
-#[command(
-    version,
-    about = "Create a Bitwarden Secrets Manager secret without putting its value in argv"
-)]
+#[command(version, about = "A Bitwarden Secrets Manager command-line tool")]
 struct Args {
-    /// The key for the new secret.
-    key: String,
-
-    /// The project UUID that will contain the new secret.
-    project_id: Uuid,
-
-    /// Read the secret value exactly from standard input instead of prompting on the terminal.
-    #[arg(long)]
-    stdin: bool,
-
-    /// An optional, non-secret note for the secret.
-    #[arg(long)]
-    note: Option<String>,
-
-    /// Update the matching secret in this project instead of creating a duplicate.
-    #[arg(long)]
-    upsert: bool,
+    #[command(subcommand)]
+    command: Command,
 
     /// Bitwarden Secrets Manager access token. Prefer BWS_ACCESS_TOKEN so it is not in argv.
-    #[arg(long, env = "BWS_ACCESS_TOKEN", hide_env_values = true)]
+    #[arg(long, global = true, env = "BWS_ACCESS_TOKEN", hide_env_values = true)]
     access_token: Option<String>,
 
     /// Bitwarden API URL, for self-hosted installations.
-    #[arg(long, env = "BWS_API_URL")]
+    #[arg(long, global = true, env = "BWS_API_URL")]
     api_url: Option<String>,
 
     /// Bitwarden identity URL, for self-hosted installations.
-    #[arg(long, env = "BWS_IDENTITY_URL")]
+    #[arg(long, global = true, env = "BWS_IDENTITY_URL")]
     identity_url: Option<String>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Create a secret without putting its value in argv.
+    Create {
+        /// The key for the new secret.
+        key: String,
+
+        /// The project UUID that will contain the new secret.
+        project_id: Uuid,
+
+        /// Read the secret value exactly from standard input instead of prompting on the terminal.
+        #[arg(long)]
+        stdin: bool,
+
+        /// An optional, non-secret note for the secret.
+        #[arg(long)]
+        note: Option<String>,
+
+        /// Update the matching secret in this project instead of creating a duplicate.
+        #[arg(long)]
+        upsert: bool,
+    },
+
+    /// List all secret names in a project. Secret values are never requested.
+    List {
+        /// The project UUID whose secret names should be listed.
+        project_id: Uuid,
+    },
 }
 
 fn secret_value(from_stdin: bool) -> Result<String> {
@@ -101,42 +113,67 @@ async fn main() -> Result<()> {
         .get_access_token_organization()
         .context("access token is not associated with an organization")?;
 
-    let existing_secret_id = if args.upsert {
+    let (key, project_id, stdin, note, upsert) = match args.command {
+        Command::List { project_id } => {
+            let identifiers = client
+                .secrets()
+                .list_by_project(&SecretIdentifiersByProjectRequest { project_id })
+                .await
+                .context("list project secrets")?;
+            let mut names: Vec<_> = identifiers
+                .data
+                .into_iter()
+                .map(|secret| secret.key)
+                .collect();
+            names.sort();
+            for name in names {
+                println!("{name}");
+            }
+            return Ok(());
+        }
+        Command::Create {
+            key,
+            project_id,
+            stdin,
+            note,
+            upsert,
+        } => (key, project_id, stdin, note, upsert),
+    };
+
+    let existing_secret_id = if upsert {
         let identifiers = client
             .secrets()
-            .list_by_project(&SecretIdentifiersByProjectRequest {
-                project_id: args.project_id,
-            })
+            .list_by_project(&SecretIdentifiersByProjectRequest { project_id })
             .await
             .context("list project secrets")?;
         single_match(
             identifiers
                 .data
                 .into_iter()
-                .filter(|secret| secret.key == args.key)
+                .filter(|secret| secret.key == key)
                 .map(|secret| secret.id),
         )?
     } else {
         None
     };
 
-    let mut value = secret_value(args.stdin)?;
+    let mut value = secret_value(stdin)?;
     let (operation, mut secret) = if let Some(secret_id) = existing_secret_id {
         let mut existing = client
             .secrets()
             .get(&SecretGetRequest { id: secret_id })
             .await
             .context("get existing secret")?;
-        let note = args.note.unwrap_or_else(|| existing.note.clone());
+        let note = note.unwrap_or_else(|| existing.note.clone());
         existing.value.zeroize();
 
         let mut request = SecretPutRequest {
             id: secret_id,
             organization_id: organization_id.into(),
-            key: args.key,
+            key: key.clone(),
             value: std::mem::take(&mut value),
             note,
-            project_ids: Some(vec![args.project_id]),
+            project_ids: Some(vec![project_id]),
             value_changed: true,
         };
         let result = client.secrets().update(&request).await;
@@ -145,10 +182,10 @@ async fn main() -> Result<()> {
     } else {
         let mut request = SecretCreateRequest {
             organization_id: organization_id.into(),
-            key: args.key,
+            key,
             value: std::mem::take(&mut value),
-            note: args.note.unwrap_or_default(),
-            project_ids: Some(vec![args.project_id]),
+            note: note.unwrap_or_default(),
+            project_ids: Some(vec![project_id]),
         };
         let result = client.secrets().create(&request).await;
         request.value.zeroize();
