@@ -1,0 +1,18 @@
+[package]
+name = "bbs"
+version = "0.1.0"
+edition = "2024"
+description = "Better Bitwarden Secrets: create Bitwarden Secrets Manager secrets without placing values in argv"
+license = "MIT"
+repository = "https://github.com/brooksmcmillin/bbs"
+
+[dependencies]
+anyhow = "1.0"
+# Pin the SDK source revision used by bws 2.1.0. The crates.io facade pulls a
+# different internal API revision, whose update request is incompatible with bws.
+bitwarden = { git = "https://github.com/bitwarden/sdk-sm.git", rev = "5265d511b0f31a81eb3adbce80402d913571aeab", features = ["secrets"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+rpassword = "7.4"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.18", features = ["v4"] }
+zeroize = "1.8"
