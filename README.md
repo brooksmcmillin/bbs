@@ -38,6 +38,14 @@ bbs list 00000000-0000-0000-0000-000000000000
 
 The names are printed one per line, sorted alphabetically. This is useful for checking whether a secret exists without leaking its value.
 
+To also show each secret's ID and whether its value is empty, use `--metadata`:
+
+```bash
+bbs list --metadata 00000000-0000-0000-0000-000000000000
+```
+
+Metadata output is tab-separated as `key`, `id`, and either `empty` or `non-empty`, sorted by key. The command retrieves each value only to determine its state; it never prints a value.
+
 ### Upsert
 
 By default, the tool always creates a secret. Pass `--upsert` to find a secret with the requested key **in the specified project** and update its value instead:
