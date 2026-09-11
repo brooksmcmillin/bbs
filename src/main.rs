@@ -53,10 +53,14 @@ enum Command {
         upsert: bool,
     },
 
-    /// List all secret names in a project. Secret values are never requested.
+    /// List all secret names in a project.
     List {
         /// The project UUID whose secret names should be listed.
         project_id: Uuid,
+
+        /// Include each secret's ID and whether its value is empty. Values are not printed.
+        #[arg(long)]
+        metadata: bool,
     },
 }
 
@@ -80,6 +84,18 @@ fn single_match(mut matches: impl Iterator<Item = Uuid>) -> Result<Option<Uuid>>
         bail!("multiple secrets with this key exist in the project; refusing to choose one")
     }
     Ok(Some(secret_id))
+}
+
+fn value_state(value: &str) -> &'static str {
+    if value.is_empty() {
+        "empty"
+    } else {
+        "non-empty"
+    }
+}
+
+fn metadata_line(key: &str, id: Uuid, value: &str) -> String {
+    format!("{key}\t{id}\t{}", value_state(value))
 }
 
 #[tokio::main]
@@ -114,20 +130,31 @@ async fn main() -> Result<()> {
         .context("access token is not associated with an organization")?;
 
     let (key, project_id, stdin, note, upsert) = match args.command {
-        Command::List { project_id } => {
+        Command::List {
+            project_id,
+            metadata,
+        } => {
             let identifiers = client
                 .secrets()
                 .list_by_project(&SecretIdentifiersByProjectRequest { project_id })
                 .await
                 .context("list project secrets")?;
-            let mut names: Vec<_> = identifiers
-                .data
-                .into_iter()
-                .map(|secret| secret.key)
-                .collect();
-            names.sort();
-            for name in names {
-                println!("{name}");
+            let mut identifiers = identifiers.data;
+            identifiers.sort_by(|left, right| left.key.cmp(&right.key));
+
+            for identifier in identifiers {
+                if metadata {
+                    let mut secret = client
+                        .secrets()
+                        .get(&SecretGetRequest { id: identifier.id })
+                        .await
+                        .context("get secret metadata")?;
+                    let line = metadata_line(&secret.key, secret.id, &secret.value);
+                    secret.value.zeroize();
+                    println!("{line}");
+                } else {
+                    println!("{}", identifier.key);
+                }
             }
             return Ok(());
         }
@@ -207,7 +234,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::single_match;
+    use super::{Args, Command, metadata_line, single_match, value_state};
+    use clap::Parser;
     use uuid::Uuid;
 
     #[test]
@@ -227,5 +255,43 @@ mod tests {
     #[test]
     fn single_match_rejects_duplicate_matches() {
         assert!(single_match([Uuid::from_u128(1), Uuid::from_u128(2)].into_iter()).is_err());
+    }
+
+    #[test]
+    fn value_state_distinguishes_empty_values() {
+        assert_eq!(value_state(""), "empty");
+        assert_eq!(value_state(" "), "non-empty");
+    }
+
+    #[test]
+    fn metadata_line_does_not_include_the_value() {
+        let id = Uuid::from_u128(1);
+        assert_eq!(
+            metadata_line("DATABASE_PASSWORD", id, ""),
+            format!("DATABASE_PASSWORD\t{id}\tempty")
+        );
+        assert_eq!(
+            metadata_line("DATABASE_PASSWORD", id, "not-for-output"),
+            format!("DATABASE_PASSWORD\t{id}\tnon-empty")
+        );
+    }
+
+    #[test]
+    fn list_metadata_flag_is_opt_in() {
+        let project_id = "00000000-0000-0000-0000-000000000001";
+        let metadata = Args::try_parse_from(["bbs", "list", "--metadata", project_id]).unwrap();
+        assert!(matches!(
+            metadata.command,
+            Command::List { metadata: true, .. }
+        ));
+
+        let names_only = Args::try_parse_from(["bbs", "list", project_id]).unwrap();
+        assert!(matches!(
+            names_only.command,
+            Command::List {
+                metadata: false,
+                ..
+            }
+        ));
     }
 }
