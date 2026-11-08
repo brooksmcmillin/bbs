@@ -59,13 +59,13 @@ bbs secret list 00000000-0000-0000-0000-000000000000
 
 The names are printed one per line, sorted alphabetically. This is useful for checking whether a secret exists without leaking its value.
 
-To also show each secret's ID and whether its value is empty, use `--metadata`:
+To also show each secret's ID, whether its value is empty, and its note, use `--metadata`:
 
 ```bash
 bbs secret list --metadata 00000000-0000-0000-0000-000000000000
 ```
 
-Metadata output is tab-separated as `key`, `id`, and either `empty` or `non-empty`, sorted by key. The command retrieves each value only to determine its state; it never prints a value.
+Metadata output is tab-separated as `key`, `id`, either `empty` or `non-empty`, and `note`, sorted by key. The command retrieves each value only to determine its state; it never prints a value.
 
 ### Upsert
 
