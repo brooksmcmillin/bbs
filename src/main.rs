@@ -1,4 +1,7 @@
-use std::{io::Read, str::FromStr};
+use std::{
+    io::{Read, Write},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, bail};
 use bitwarden::secrets_manager::{
@@ -121,6 +124,30 @@ async fn resolve_project(
     )
 }
 
+async fn dispatch_secret(
+    command: SecretCommand,
+    resolve: impl AsyncFnOnce(&str) -> Result<Uuid>,
+    execute: impl AsyncFnOnce(SecretCommand, Uuid) -> Result<()>,
+) -> Result<()> {
+    let project = match &command {
+        SecretCommand::List { project, .. } | SecretCommand::Create { project, .. } => project,
+    };
+    let project_id = resolve(project).await?;
+    execute(command, project_id).await
+}
+
+fn write_projects<'a>(
+    projects: impl Iterator<Item = (&'a str, Uuid)>,
+    output: &mut impl Write,
+) -> std::io::Result<()> {
+    let mut projects: Vec<_> = projects.collect();
+    projects.sort_by(|left, right| left.0.cmp(right.0));
+    for (name, id) in projects {
+        writeln!(output, "{name}\t{id}")?;
+    }
+    Ok(())
+}
+
 fn secret_value(from_stdin: bool) -> Result<String> {
     if from_stdin {
         let mut value = String::new();
@@ -190,7 +217,7 @@ async fn main() -> Result<()> {
         Command::Project {
             command: ProjectCommand::List,
         } => {
-            let mut projects = client
+            let projects = client
                 .projects()
                 .list(&ProjectsListRequest {
                     organization_id: organization_id.into(),
@@ -198,18 +225,33 @@ async fn main() -> Result<()> {
                 .await
                 .context("list projects")?
                 .data;
-            projects.sort_by(|left, right| left.name.cmp(&right.name));
-            for project in projects {
-                println!("{}\t{}", project.name, project.id);
-            }
+            write_projects(
+                projects
+                    .iter()
+                    .map(|project| (project.name.as_str(), project.id)),
+                &mut std::io::stdout().lock(),
+            )
+            .context("write projects")?;
             return Ok(());
         }
         Command::Secret { command } => command,
     };
-    let project = match &command {
-        SecretCommand::List { project, .. } | SecretCommand::Create { project, .. } => project,
-    };
-    let project_id = resolve_project(&client, organization_id.into(), project).await?;
+    dispatch_secret(
+        command,
+        async |project| resolve_project(&client, organization_id.into(), project).await,
+        async |command, project_id| {
+            execute_secret_command(&client, organization_id.into(), command, project_id).await
+        },
+    )
+    .await
+}
+
+async fn execute_secret_command(
+    client: &SecretsManagerClient,
+    organization_id: Uuid,
+    command: SecretCommand,
+    project_id: Uuid,
+) -> Result<()> {
     let (key, stdin, note, upsert) = match command {
         SecretCommand::List { metadata, .. } => {
             let identifiers = client
@@ -274,7 +316,7 @@ async fn main() -> Result<()> {
 
         let mut request = SecretPutRequest {
             id: secret_id,
-            organization_id: organization_id.into(),
+            organization_id,
             key: key.clone(),
             value: std::mem::take(&mut value),
             note,
@@ -286,7 +328,7 @@ async fn main() -> Result<()> {
         ("updated", result.context("update secret")?)
     } else {
         let mut request = SecretCreateRequest {
-            organization_id: organization_id.into(),
+            organization_id,
             key,
             value: std::mem::take(&mut value),
             note: note.unwrap_or_default(),
@@ -313,8 +355,9 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Command, ProjectCommand, SecretCommand, SecretsManagerClient, metadata_line,
-        named_project_id, resolve_project, single_match, value_state,
+        Args, Command, ProjectCommand, SecretCommand, SecretsManagerClient, dispatch_secret,
+        metadata_line, named_project_id, resolve_project, single_match, value_state,
+        write_projects,
     };
     use clap::Parser;
     use uuid::Uuid;
@@ -421,6 +464,91 @@ mod tests {
         assert!(named_project_id("missing", std::iter::empty()).is_err());
     }
 
+    #[tokio::test]
+    async fn failed_project_resolution_never_enters_secret_handler() {
+        use std::cell::Cell;
+
+        for argv in [
+            vec!["bbs", "secret", "list", "Production API"],
+            vec!["bbs", "secret", "list", "Production API", "--metadata"],
+            vec!["bbs", "secret", "create", "PASSWORD", "Production API"],
+            vec![
+                "bbs",
+                "secret",
+                "create",
+                "PASSWORD",
+                "Production API",
+                "--stdin",
+                "--upsert",
+            ],
+        ] {
+            for projects in [
+                vec![],
+                vec![
+                    ("Production API", Uuid::from_u128(1)),
+                    ("Production API", Uuid::from_u128(2)),
+                ],
+            ] {
+                let Command::Secret { command } = Args::try_parse_from(&argv).unwrap().command
+                else {
+                    panic!("expected secret command")
+                };
+                let handler_calls = Cell::new(0);
+                let error = dispatch_secret(
+                    command,
+                    async |name| named_project_id(name, projects.iter().copied()),
+                    async |_, _| {
+                        handler_calls.set(handler_calls.get() + 1);
+                        panic!("secret operations and value input must not be reached")
+                    },
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(handler_calls.get(), 0);
+                let expected = if projects.is_empty() {
+                    "no accessible project"
+                } else {
+                    "multiple accessible projects"
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_resolution_dispatches_command_and_project_once() {
+        use std::cell::Cell;
+
+        let id = Uuid::from_u128(1);
+        let calls = Cell::new(0);
+        let Command::Secret { command } =
+            Args::try_parse_from(["bbs", "secret", "list", "Production API", "--metadata"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected secret command")
+        };
+        dispatch_secret(
+            command,
+            async |name| {
+                assert_eq!(name, "Production API");
+                Ok(id)
+            },
+            async |command, project_id| {
+                calls.set(calls.get() + 1);
+                assert_eq!(project_id, id);
+                assert!(matches!(
+                    command,
+                    SecretCommand::List { metadata: true, .. }
+                ));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
     #[test]
     fn secret_commands_accept_project_names() {
         for argv in [
@@ -445,6 +573,29 @@ mod tests {
             };
             assert_eq!(project, "Production API");
         }
+    }
+
+    #[test]
+    fn project_list_output_is_sorted_and_tab_separated() {
+        let alpha = Uuid::from_u128(1);
+        let zulu = Uuid::from_u128(2);
+        let mut output = Vec::new();
+        write_projects(
+            [("Zulu", zulu), ("Alpha API", alpha)].into_iter(),
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            format!("Alpha API\t{alpha}\nZulu\t{zulu}\n").as_bytes()
+        );
+    }
+
+    #[test]
+    fn project_list_output_is_empty_for_no_projects() {
+        let mut output = Vec::new();
+        write_projects(std::iter::empty(), &mut output).unwrap();
+        assert!(output.is_empty());
     }
 
     #[test]
