@@ -3,6 +3,7 @@ use std::{io::Read, str::FromStr};
 use anyhow::{Context, Result, bail};
 use bitwarden::secrets_manager::{
     AccessToken, AccessTokenLoginRequest, ClientSettings, SecretsManagerClient,
+    projects::ProjectsListRequest,
     secrets::{
         SecretCreateRequest, SecretGetRequest, SecretIdentifiersByProjectRequest, SecretPutRequest,
     },
@@ -32,13 +33,34 @@ struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
+    /// View projects.
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+
+    /// Manage secrets.
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ProjectCommand {
+    /// List accessible projects with their names and IDs.
+    List,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum SecretCommand {
     /// Create a secret without putting its value in argv.
     Create {
         /// The key for the new secret.
         key: String,
 
-        /// The project UUID that will contain the new secret.
-        project_id: Uuid,
+        /// The project UUID or exact, case-sensitive name that will contain the new secret.
+        project: String,
 
         /// Read the secret value exactly from standard input instead of prompting on the terminal.
         #[arg(long)]
@@ -55,13 +77,48 @@ enum Command {
 
     /// List all secret names in a project.
     List {
-        /// The project UUID whose secret names should be listed.
-        project_id: Uuid,
+        /// The project UUID or exact, case-sensitive name whose secrets should be listed.
+        project: String,
 
         /// Include each secret's ID and whether its value is empty. Values are not printed.
         #[arg(long)]
         metadata: bool,
     },
+}
+
+fn named_project_id<'a>(
+    name: &str,
+    projects: impl Iterator<Item = (&'a str, Uuid)>,
+) -> Result<Uuid> {
+    let mut matches = projects.filter(|(project_name, _)| *project_name == name);
+    let Some((_, id)) = matches.next() else {
+        bail!("no accessible project named {name:?}; use `bbs project list` to find projects")
+    };
+    if matches.next().is_some() {
+        bail!(
+            "multiple accessible projects named {name:?}; use a project UUID from `bbs project list`"
+        )
+    }
+    Ok(id)
+}
+
+async fn resolve_project(
+    client: &SecretsManagerClient,
+    organization_id: Uuid,
+    project: &str,
+) -> Result<Uuid> {
+    if let Ok(id) = Uuid::parse_str(project) {
+        return Ok(id);
+    }
+    let projects = client
+        .projects()
+        .list(&ProjectsListRequest { organization_id })
+        .await
+        .context("list projects to resolve project name")?;
+    named_project_id(
+        project,
+        projects.data.iter().map(|p| (p.name.as_str(), p.id)),
+    )
 }
 
 fn secret_value(from_stdin: bool) -> Result<String> {
@@ -129,11 +186,32 @@ async fn main() -> Result<()> {
         .get_access_token_organization()
         .context("access token is not associated with an organization")?;
 
-    let (key, project_id, stdin, note, upsert) = match args.command {
-        Command::List {
-            project_id,
-            metadata,
+    let command = match args.command {
+        Command::Project {
+            command: ProjectCommand::List,
         } => {
+            let mut projects = client
+                .projects()
+                .list(&ProjectsListRequest {
+                    organization_id: organization_id.into(),
+                })
+                .await
+                .context("list projects")?
+                .data;
+            projects.sort_by(|left, right| left.name.cmp(&right.name));
+            for project in projects {
+                println!("{}\t{}", project.name, project.id);
+            }
+            return Ok(());
+        }
+        Command::Secret { command } => command,
+    };
+    let project = match &command {
+        SecretCommand::List { project, .. } | SecretCommand::Create { project, .. } => project,
+    };
+    let project_id = resolve_project(&client, organization_id.into(), project).await?;
+    let (key, stdin, note, upsert) = match command {
+        SecretCommand::List { metadata, .. } => {
             let identifiers = client
                 .secrets()
                 .list_by_project(&SecretIdentifiersByProjectRequest { project_id })
@@ -158,13 +236,13 @@ async fn main() -> Result<()> {
             }
             return Ok(());
         }
-        Command::Create {
+        SecretCommand::Create {
             key,
-            project_id,
             stdin,
             note,
             upsert,
-        } => (key, project_id, stdin, note, upsert),
+            ..
+        } => (key, stdin, note, upsert),
     };
 
     let existing_secret_id = if upsert {
@@ -234,7 +312,10 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, Command, metadata_line, single_match, value_state};
+    use super::{
+        Args, Command, ProjectCommand, SecretCommand, SecretsManagerClient, metadata_line,
+        named_project_id, resolve_project, single_match, value_state,
+    };
     use clap::Parser;
     use uuid::Uuid;
 
@@ -277,20 +358,140 @@ mod tests {
     }
 
     #[test]
+    fn secret_create_preserves_options_and_global_flags() {
+        let project_id = Uuid::from_u128(1);
+        let args = Args::try_parse_from([
+            "bbs",
+            "secret",
+            "create",
+            "PASSWORD",
+            &project_id.to_string(),
+            "--stdin",
+            "--upsert",
+            "--note",
+            "description",
+            "--api-url",
+            "https://example.com",
+        ])
+        .unwrap();
+        assert_eq!(args.api_url.as_deref(), Some("https://example.com"));
+        assert!(matches!(args.command, Command::Secret {
+            command: SecretCommand::Create { key, project, stdin: true, upsert: true, note: Some(note) }
+        } if key == "PASSWORD" && project == project_id.to_string() && note == "description"));
+    }
+
+    #[tokio::test]
+    async fn project_uuid_does_not_require_project_lookup() {
+        let id = Uuid::from_u128(1);
+        let client = SecretsManagerClient::new(None);
+        assert_eq!(
+            resolve_project(&client, Uuid::nil(), &id.to_string())
+                .await
+                .unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn project_name_matching_is_exact_and_unique() {
+        let id = Uuid::from_u128(1);
+        let projects = [("Production API", id), ("Other", Uuid::from_u128(2))];
+        assert_eq!(
+            named_project_id("Production API", projects.into_iter()).unwrap(),
+            id
+        );
+        for missing in ["production api", "Production", " Production API", "missing"] {
+            let error = named_project_id(missing, projects.into_iter())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no accessible project"));
+        }
+        let error = named_project_id(
+            "Production API",
+            [
+                ("Production API", id),
+                ("Production API", Uuid::from_u128(2)),
+            ]
+            .into_iter(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("multiple accessible projects"));
+        assert!(error.contains("project UUID"));
+        assert!(named_project_id("missing", std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn secret_commands_accept_project_names() {
+        for argv in [
+            vec!["bbs", "secret", "list", "Production API"],
+            vec![
+                "bbs",
+                "secret",
+                "create",
+                "PASSWORD",
+                "Production API",
+                "--upsert",
+            ],
+        ] {
+            let args = Args::try_parse_from(argv).unwrap();
+            let Command::Secret { command } = args.command else {
+                panic!("expected secret command")
+            };
+            let project = match command {
+                SecretCommand::Create { project, .. } | SecretCommand::List { project, .. } => {
+                    project
+                }
+            };
+            assert_eq!(project, "Production API");
+        }
+    }
+
+    #[test]
+    fn project_list_accepts_global_flags() {
+        for argv in [
+            vec!["bbs", "--api-url", "https://example.com", "project", "list"],
+            vec!["bbs", "project", "--api-url", "https://example.com", "list"],
+            vec!["bbs", "project", "list", "--api-url", "https://example.com"],
+        ] {
+            let args = Args::try_parse_from(argv).unwrap();
+            assert_eq!(args.api_url.as_deref(), Some("https://example.com"));
+            assert!(matches!(
+                args.command,
+                Command::Project {
+                    command: ProjectCommand::List
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn command_groups_require_a_subcommand() {
+        for args in [vec!["bbs"], vec!["bbs", "secret"], vec!["bbs", "project"]] {
+            assert!(Args::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn list_metadata_flag_is_opt_in() {
         let project_id = "00000000-0000-0000-0000-000000000001";
-        let metadata = Args::try_parse_from(["bbs", "list", "--metadata", project_id]).unwrap();
+        let metadata =
+            Args::try_parse_from(["bbs", "secret", "list", "--metadata", project_id]).unwrap();
         assert!(matches!(
             metadata.command,
-            Command::List { metadata: true, .. }
+            Command::Secret {
+                command: SecretCommand::List { metadata: true, .. }
+            }
         ));
 
-        let names_only = Args::try_parse_from(["bbs", "list", project_id]).unwrap();
+        let names_only = Args::try_parse_from(["bbs", "secret", "list", project_id]).unwrap();
         assert!(matches!(
             names_only.command,
-            Command::List {
-                metadata: false,
-                ..
+            Command::Secret {
+                command: SecretCommand::List {
+                    metadata: false,
+                    ..
+                }
             }
         ));
     }
