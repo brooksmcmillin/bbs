@@ -83,7 +83,7 @@ enum SecretCommand {
         /// The project UUID or exact, case-sensitive name whose secrets should be listed.
         project: String,
 
-        /// Include each secret's ID and whether its value is empty. Values are not printed.
+        /// Include each secret's ID, value state, and note. Values are not printed.
         #[arg(long)]
         metadata: bool,
     },
@@ -178,8 +178,8 @@ fn value_state(value: &str) -> &'static str {
     }
 }
 
-fn metadata_line(key: &str, id: Uuid, value: &str) -> String {
-    format!("{key}\t{id}\t{}", value_state(value))
+fn metadata_line(key: &str, id: Uuid, value: &str, note: &str) -> String {
+    format!("{key}\t{id}\t{}\t{note}", value_state(value))
 }
 
 #[tokio::main]
@@ -269,7 +269,7 @@ async fn execute_secret_command(
                         .get(&SecretGetRequest { id: identifier.id })
                         .await
                         .context("get secret metadata")?;
-                    let line = metadata_line(&secret.key, secret.id, &secret.value);
+                    let line = metadata_line(&secret.key, secret.id, &secret.value, &secret.note);
                     secret.value.zeroize();
                     println!("{line}");
                 } else {
@@ -391,12 +391,26 @@ mod tests {
     fn metadata_line_does_not_include_the_value() {
         let id = Uuid::from_u128(1);
         assert_eq!(
-            metadata_line("DATABASE_PASSWORD", id, ""),
-            format!("DATABASE_PASSWORD\t{id}\tempty")
+            metadata_line("DATABASE_PASSWORD", id, "", "Database credentials"),
+            format!("DATABASE_PASSWORD\t{id}\tempty\tDatabase credentials")
         );
         assert_eq!(
-            metadata_line("DATABASE_PASSWORD", id, "not-for-output"),
-            format!("DATABASE_PASSWORD\t{id}\tnon-empty")
+            metadata_line(
+                "DATABASE_PASSWORD",
+                id,
+                "not-for-output",
+                "Database credentials"
+            ),
+            format!("DATABASE_PASSWORD\t{id}\tnon-empty\tDatabase credentials")
+        );
+    }
+
+    #[test]
+    fn metadata_line_includes_an_empty_note_column() {
+        let id = Uuid::from_u128(1);
+        assert_eq!(
+            metadata_line("DATABASE_PASSWORD", id, "not-for-output", ""),
+            format!("DATABASE_PASSWORD\t{id}\tnon-empty\t")
         );
     }
 
