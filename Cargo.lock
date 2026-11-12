@@ -185,6 +185,8 @@ dependencies = [
  "bitwarden",
  "clap",
  "rpassword",
+ "serde",
+ "serde_json",
  "tokio",
  "uuid",
  "zeroize",
