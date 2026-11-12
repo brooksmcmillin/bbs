@@ -1,3 +1,5 @@
+mod inventory;
+
 use std::{
     io::{Read, Write},
     str::FromStr,
@@ -52,7 +54,11 @@ enum Command {
 #[derive(Debug, clap::Subcommand)]
 enum ProjectCommand {
     /// List accessible projects with their names and IDs.
-    List,
+    List {
+        /// Emit identifier-only JSON instead of tab-separated output.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -86,6 +92,10 @@ enum SecretCommand {
         /// Include each secret's ID, value state, and note. Values are not printed.
         #[arg(long)]
         metadata: bool,
+
+        /// Emit identifier-only JSON; never retrieve values or notes.
+        #[arg(long, conflicts_with = "metadata")]
+        json: bool,
     },
 }
 
@@ -185,6 +195,24 @@ fn metadata_line(key: &str, id: Uuid, value: &str, note: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    let json = matches!(
+        &args.command,
+        Command::Project {
+            command: ProjectCommand::List { json: true }
+        } | Command::Secret {
+            command: SecretCommand::List { json: true, .. }
+        }
+    );
+    match run(args).await {
+        Err(error) if json => {
+            eprintln!("{}", inventory::error_json(&error));
+            std::process::exit(1);
+        }
+        result => result,
+    }
+}
+
+async fn run(args: Args) -> Result<()> {
     let access_token = args
         .access_token
         .as_deref()
@@ -215,7 +243,36 @@ async fn main() -> Result<()> {
 
     let command = match args.command {
         Command::Project {
-            command: ProjectCommand::List,
+            command: ProjectCommand::List { json: true },
+        } => {
+            inventory::write(
+                &client,
+                organization_id.into(),
+                None,
+                &mut std::io::stdout().lock(),
+            )
+            .await?;
+            return Ok(());
+        }
+        Command::Secret {
+            command:
+                SecretCommand::List {
+                    project,
+                    json: true,
+                    ..
+                },
+        } => {
+            inventory::write(
+                &client,
+                organization_id.into(),
+                Some(&project),
+                &mut std::io::stdout().lock(),
+            )
+            .await?;
+            return Ok(());
+        }
+        Command::Project {
+            command: ProjectCommand::List { json: false },
         } => {
             let projects = client
                 .projects()
@@ -624,7 +681,7 @@ mod tests {
             assert!(matches!(
                 args.command,
                 Command::Project {
-                    command: ProjectCommand::List
+                    command: ProjectCommand::List { json: false }
                 }
             ));
         }

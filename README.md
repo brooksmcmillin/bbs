@@ -67,6 +67,61 @@ bbs secret list --metadata 00000000-0000-0000-0000-000000000000
 
 Metadata output is tab-separated as `key`, `id`, either `empty` or `non-empty`, and `note`, sorted by key. The command retrieves each value only to determine its state; it never prints a value.
 
+### Identifier-only JSON inventory
+
+For automation, use the following fixed commands (put `--` before project names
+that might begin with a dash):
+
+```bash
+bbs project list --json
+bbs secret list --json -- "Production API"
+```
+
+On success, exit status is 0 and stdout is one JSON array followed by a newline:
+
+```json
+[{"id":"00000000-0000-0000-0000-000000000001","name":"Production API"}]
+```
+
+```json
+[{"id":"00000000-0000-0000-0000-000000000002","key":"DATABASE_PASSWORD","project_id":"00000000-0000-0000-0000-000000000001"}]
+```
+
+These are the only record fields. Projects sort by name then ID; secrets sort
+by key then ID. Strings use JSON escaping, including quotes, tabs, newlines and
+Unicode. Empty successful lists are `[]`; duplicate secret keys are preserved as
+separate records so consumers can report them. `project_id` is the queried project.
+
+JSON secret listing resolves both UUIDs and exact, case-sensitive names against
+accessible projects first. An unknown/inaccessible name or UUID is an error, not
+an empty secret list. Duplicate project names require a UUID; UUID-shaped names
+are interpreted as IDs. No partial results are emitted if enumeration fails.
+
+For a valid JSON-mode command, runtime failure exits 1 and writes only a safe
+JSON error to stderr, for example:
+
+```json
+{"error":{"code":"project_not_found"}}
+```
+
+Codes are `project_not_found`, `project_ambiguous`, `projects_unavailable`,
+`secrets_unavailable`, or `inventory_failed` (including authentication, token
+configuration and output errors). Raw SDK error details are intentionally omitted.
+Failures before output leave stdout empty. An output write/flush failure can
+leave a partial result; consumers must discard stdout on any nonzero exit.
+CLI syntax errors still use clap's normal diagnostics and exit status 2.
+`--json` and `--metadata` are mutually exclusive; existing non-JSON commands are
+unchanged.
+
+Inventory calls only project and secret-identifier listing APIs, never secret
+get/create/update APIs. It does not retrieve values or notes or determine
+emptiness, validity or global existence. The legacy `--metadata` mode **does**
+retrieve values and notes; it is not an inventory substitute. A read-capable BWS
+token can still retrieve values through other commands: use a narrowly scoped
+machine account, keep its token outside argv/logs, and enforce caller/project
+authorization in the consuming service. These CLI tests do not establish live
+Bitwarden availability or deployment readiness.
+
 ### Upsert
 
 By default, the tool always creates a secret. Pass `--upsert` to find a secret with the requested key **in the specified project** and update its value instead:
