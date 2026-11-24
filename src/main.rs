@@ -11,6 +11,7 @@ use bitwarden::secrets_manager::{
     projects::ProjectsListRequest,
     secrets::{
         SecretCreateRequest, SecretGetRequest, SecretIdentifiersByProjectRequest, SecretPutRequest,
+        SecretResponse,
     },
 };
 use chrono::NaiveDate;
@@ -252,6 +253,18 @@ fn format_note(owner: &str, rotation: &str, last_rotated: &str) -> String {
     format!("owner={owner} | rotation={rotation} | last_rotated={last_rotated}")
 }
 
+fn note_update_request(existing: SecretResponse, note: String) -> SecretPutRequest {
+    SecretPutRequest {
+        id: existing.id,
+        organization_id: existing.organization_id,
+        key: existing.key,
+        value: existing.value,
+        note,
+        project_ids: existing.project_id.map(|id| vec![id]),
+        value_changed: false,
+    }
+}
+
 fn value_state(value: &str) -> &'static str {
     if value.is_empty() {
         "empty"
@@ -425,7 +438,11 @@ async fn execute_secret_command(
                 .get(&SecretGetRequest { id })
                 .await
                 .context("get existing secret")?;
-            if existing.project_id != Some(project_id) || existing.key != key {
+            if existing.id != id
+                || existing.organization_id != organization_id
+                || existing.project_id != Some(project_id)
+                || existing.key != key
+            {
                 existing.value.zeroize();
                 bail!("the secret no longer matches this project and key");
             }
@@ -436,15 +453,8 @@ async fn execute_secret_command(
                     "the Bitwarden SDK cannot safely update notes on secrets with empty values or surrounding key whitespace"
                 );
             }
-            let mut request = SecretPutRequest {
-                id,
-                organization_id,
-                key: existing.key,
-                value: existing.value,
-                note: format_note(&owner, &rotation, &last_rotated),
-                project_ids: Some(vec![project_id]),
-                value_changed: false,
-            };
+            let mut request =
+                note_update_request(existing, format_note(&owner, &rotation, &last_rotated));
             let result = client.secrets().update(&request).await;
             request.value.zeroize();
             let mut updated = result.context("update secret note")?;
@@ -564,6 +574,35 @@ mod tests {
             format_note(&owner, &rotation, &last_rotated),
             "owner=platform | rotation=90d | last_rotated=2024-02-29"
         );
+    }
+
+    #[test]
+    fn note_update_request_replaces_only_the_note() {
+        let id = Uuid::from_u128(1);
+        let organization_id = Uuid::from_u128(2);
+        let project_id = Uuid::from_u128(3);
+        let value = "  synthetic\nvalue\t ";
+        let note = "owner=platform | rotation=manual | last_rotated=2026-07-01";
+        let request = super::note_update_request(
+            super::SecretResponse {
+                id,
+                organization_id,
+                project_id: Some(project_id),
+                key: "PASSWORD".to_owned(),
+                value: value.to_owned(),
+                note: "previous note".to_owned(),
+                creation_date: chrono::DateTime::UNIX_EPOCH,
+                revision_date: chrono::DateTime::UNIX_EPOCH,
+            },
+            note.to_owned(),
+        );
+        assert_eq!(request.id, id);
+        assert_eq!(request.organization_id, organization_id);
+        assert_eq!(request.key, "PASSWORD");
+        assert_eq!(request.project_ids, Some(vec![project_id]));
+        assert_eq!(request.value.as_bytes(), value.as_bytes());
+        assert_eq!(request.note, note);
+        assert!(!request.value_changed);
     }
 
     #[test]
