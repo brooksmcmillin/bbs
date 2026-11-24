@@ -13,6 +13,7 @@ use bitwarden::secrets_manager::{
         SecretCreateRequest, SecretGetRequest, SecretIdentifiersByProjectRequest, SecretPutRequest,
     },
 };
+use chrono::NaiveDate;
 use clap::Parser;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -84,6 +85,12 @@ enum SecretCommand {
         upsert: bool,
     },
 
+    /// Manage non-secret notes on existing secrets.
+    Note {
+        #[command(subcommand)]
+        command: NoteCommand,
+    },
+
     /// List all secret names in a project.
     List {
         /// The project UUID or exact, case-sensitive name whose secrets should be listed.
@@ -97,6 +104,44 @@ enum SecretCommand {
         #[arg(long, conflicts_with = "metadata")]
         json: bool,
     },
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum NoteCommand {
+    /// Replace the full note on exactly one existing secret.
+    Set {
+        /// The exact, case-sensitive key of the existing secret.
+        key: String,
+        /// The project UUID or exact, case-sensitive name.
+        project: String,
+        /// The person or team responsible for the secret.
+        #[arg(long, value_parser = note_field)]
+        owner: String,
+        /// The rotation cadence (e.g. 90d), manual, or provider-no-api.
+        #[arg(long, value_parser = note_field)]
+        rotation: String,
+        /// The actual last rotation date (YYYY-MM-DD).
+        #[arg(long, value_parser = rotation_date)]
+        last_rotated: String,
+    },
+}
+
+fn note_field(input: &str) -> Result<String> {
+    let value = input.trim();
+    if value.is_empty() || input.chars().any(|ch| ch == '|' || ch.is_control()) {
+        bail!("expected non-empty text without pipes or control characters");
+    }
+    Ok(value.to_owned())
+}
+
+fn rotation_date(input: &str) -> Result<String> {
+    if input.len() != 10
+        || input.starts_with("0000")
+        || !NaiveDate::parse_from_str(input, "%Y-%m-%d").is_ok_and(|date| date.to_string() == input)
+    {
+        bail!("expected a calendar date in YYYY-MM-DD format");
+    }
+    Ok(input.to_owned())
 }
 
 fn named_project_id<'a>(
@@ -140,7 +185,11 @@ async fn dispatch_secret(
     execute: impl AsyncFnOnce(SecretCommand, Uuid) -> Result<()>,
 ) -> Result<()> {
     let project = match &command {
-        SecretCommand::List { project, .. } | SecretCommand::Create { project, .. } => project,
+        SecretCommand::List { project, .. }
+        | SecretCommand::Create { project, .. }
+        | SecretCommand::Note {
+            command: NoteCommand::Set { project, .. },
+        } => project,
     };
     let project_id = resolve(project).await?;
     execute(command, project_id).await
@@ -178,6 +227,29 @@ fn single_match(mut matches: impl Iterator<Item = Uuid>) -> Result<Option<Uuid>>
         bail!("multiple secrets with this key exist in the project; refusing to choose one")
     }
     Ok(Some(secret_id))
+}
+
+async fn find_secret_id(
+    client: &SecretsManagerClient,
+    project_id: Uuid,
+    key: &str,
+) -> Result<Option<Uuid>> {
+    let identifiers = client
+        .secrets()
+        .list_by_project(&SecretIdentifiersByProjectRequest { project_id })
+        .await
+        .context("list project secrets")?;
+    single_match(
+        identifiers
+            .data
+            .into_iter()
+            .filter(|secret| secret.key == key)
+            .map(|secret| secret.id),
+    )
+}
+
+fn format_note(owner: &str, rotation: &str, last_rotated: &str) -> String {
+    format!("owner={owner} | rotation={rotation} | last_rotated={last_rotated}")
 }
 
 fn value_state(value: &str) -> &'static str {
@@ -335,6 +407,51 @@ async fn execute_secret_command(
             }
             return Ok(());
         }
+        SecretCommand::Note {
+            command:
+                NoteCommand::Set {
+                    key,
+                    owner,
+                    rotation,
+                    last_rotated,
+                    ..
+                },
+        } => {
+            let id = find_secret_id(client, project_id, &key)
+                .await?
+                .context("no secret with this key exists in the project")?;
+            let mut existing = client
+                .secrets()
+                .get(&SecretGetRequest { id })
+                .await
+                .context("get existing secret")?;
+            if existing.project_id != Some(project_id) || existing.key != key {
+                existing.value.zeroize();
+                bail!("the secret no longer matches this project and key");
+            }
+            // The pinned SDK rejects empty values and trims keys on update.
+            if existing.value.is_empty() || existing.key.trim() != existing.key {
+                existing.value.zeroize();
+                bail!(
+                    "the Bitwarden SDK cannot safely update notes on secrets with empty values or surrounding key whitespace"
+                );
+            }
+            let mut request = SecretPutRequest {
+                id,
+                organization_id,
+                key: existing.key,
+                value: existing.value,
+                note: format_note(&owner, &rotation, &last_rotated),
+                project_ids: Some(vec![project_id]),
+                value_changed: false,
+            };
+            let result = client.secrets().update(&request).await;
+            request.value.zeroize();
+            let mut updated = result.context("update secret note")?;
+            updated.value.zeroize();
+            println!("updated note for secret {id} (key: {key}, project: {project_id})");
+            return Ok(());
+        }
         SecretCommand::Create {
             key,
             stdin,
@@ -345,18 +462,7 @@ async fn execute_secret_command(
     };
 
     let existing_secret_id = if upsert {
-        let identifiers = client
-            .secrets()
-            .list_by_project(&SecretIdentifiersByProjectRequest { project_id })
-            .await
-            .context("list project secrets")?;
-        single_match(
-            identifiers
-                .data
-                .into_iter()
-                .filter(|secret| secret.key == key)
-                .map(|secret| secret.id),
-        )?
+        find_secret_id(client, project_id, &key).await?
     } else {
         None
     };
@@ -412,12 +518,115 @@ async fn execute_secret_command(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, Command, ProjectCommand, SecretCommand, SecretsManagerClient, dispatch_secret,
-        metadata_line, named_project_id, resolve_project, single_match, value_state,
-        write_projects,
+        Args, Command, NoteCommand, ProjectCommand, SecretCommand, SecretsManagerClient,
+        dispatch_secret, format_note, metadata_line, named_project_id, resolve_project,
+        single_match, value_state, write_projects,
     };
     use clap::Parser;
     use uuid::Uuid;
+
+    #[test]
+    fn note_set_formats_the_full_note() {
+        let args = Args::try_parse_from([
+            "bbs",
+            "secret",
+            "note",
+            "set",
+            "DATABASE_PASSWORD",
+            "Production API",
+            "--owner",
+            " platform ",
+            "--rotation",
+            "90d",
+            "--last-rotated",
+            "2024-02-29",
+        ])
+        .unwrap();
+        let Command::Secret {
+            command:
+                SecretCommand::Note {
+                    command:
+                        NoteCommand::Set {
+                            key,
+                            project,
+                            owner,
+                            rotation,
+                            last_rotated,
+                        },
+                },
+        } = args.command
+        else {
+            panic!("expected note set")
+        };
+        assert_eq!(key, "DATABASE_PASSWORD");
+        assert_eq!(project, "Production API");
+        assert_eq!(
+            format_note(&owner, &rotation, &last_rotated),
+            "owner=platform | rotation=90d | last_rotated=2024-02-29"
+        );
+    }
+
+    #[test]
+    fn note_set_rejects_invalid_or_missing_fields() {
+        for flags in [
+            [
+                "--owner",
+                "platform",
+                "--rotation",
+                "manual",
+                "--last-rotated",
+                "2025-02-29",
+            ],
+            [
+                "--owner",
+                "platform",
+                "--rotation",
+                "manual",
+                "--last-rotated",
+                "2025-1-02",
+            ],
+            [
+                "--owner",
+                "platform | other",
+                "--rotation",
+                "90d",
+                "--last-rotated",
+                "2025-01-02",
+            ],
+            [
+                "--owner",
+                "platform",
+                "--rotation",
+                "\nmanual",
+                "--last-rotated",
+                "2025-01-02",
+            ],
+        ] {
+            assert!(
+                Args::try_parse_from(
+                    ["bbs", "secret", "note", "set", "key", "project"]
+                        .into_iter()
+                        .chain(flags)
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            Args::try_parse_from([
+                "bbs",
+                "secret",
+                "note",
+                "set",
+                "key",
+                "project",
+                "--owner",
+                "platform",
+                "--rotation",
+                "provider-no-api"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn single_match_returns_the_one_match() {
@@ -638,9 +847,11 @@ mod tests {
                 panic!("expected secret command")
             };
             let project = match command {
-                SecretCommand::Create { project, .. } | SecretCommand::List { project, .. } => {
-                    project
-                }
+                SecretCommand::Create { project, .. }
+                | SecretCommand::List { project, .. }
+                | SecretCommand::Note {
+                    command: NoteCommand::Set { project, .. },
+                } => project,
             };
             assert_eq!(project, "Production API");
         }

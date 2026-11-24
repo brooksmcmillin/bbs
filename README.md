@@ -134,6 +134,19 @@ If no match exists, it creates one. If duplicate matching keys already exist in 
 
 For a self-hosted Bitwarden server, set `BWS_API_URL` and `BWS_IDENTITY_URL` (or use `--api-url` and `--identity-url`).
 
+### Set a rotation note
+
+Replace the entire note on one existing secret without entering a new secret value:
+
+```sh
+bbs secret note set DATABASE_PASSWORD "Production API" \
+  --owner platform --rotation 90d --last-rotated 2026-07-01
+```
+
+This stores `owner=platform | rotation=90d | last_rotated=2026-07-01`. Use a cadence such as `90d`, `manual`, or `provider-no-api`; the date must be the actual last rotation in `YYYY-MM-DD` format. The command requires read and write access, rejects missing or duplicate keys in the project, and never creates a secret.
+
+Bitwarden's SDK sends a full update with the existing value and `value_changed: false`. Avoid running this alongside a rotation or another edit. The SDK does not support this operation on secrets with empty values or keys with surrounding whitespace.
+
 ## Security properties
 
 - The secret value is never an argv value, so it is absent from shell history and normal process-list inspection.
