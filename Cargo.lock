@@ -183,6 +183,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bitwarden",
+ "chrono",
  "clap",
  "rpassword",
  "serde",
